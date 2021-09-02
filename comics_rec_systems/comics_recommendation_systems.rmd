@@ -1,0 +1,1237 @@
+---
+title: "Итоговый проект"
+author: "Группа 27"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+### Предобработка 
+
+```{r setup, include=FALSE}
+#настроим чанки, чтобы не выдавали ненужную информацию
+knitr::opts_chunk$set(warning=FALSE, message = F)
+```
+
+
+##### Цель проекта
+
+В этой работе будет проанализирован датасет про 501 комикс, а так же ~12000 отзывов пользователей о них. Далее будут созданы 2 рекомендательные системы: content-based и collaborative filtering, к каждой будут написаны одна или несколько функций. В конце анализа будет произведена оценка каждой из систем.
+
+На стадии предобрадотки проекта были проведены текстовый и сетевой анализы. Некоторые из выводов были использованы в дальнейшем пи построении рекомендательной системы. Начнем с текстового анализа.
+
+```{r}
+# загружаем библиотеки
+library(tidytext) # обработка текста
+library(ggplot2) # графики
+library(wordcloud2) # облака слов
+library(tidyr) # переформатирование таблиц (длинный - широкий формат, например)
+library(stringr) # обработка строк (удаление, поиск, замена символов)
+library(dplyr) # преобразование данных
+library(stopwords)
+library(textstem)
+library(kableExtra)
+library(data.table)
+library(igraph)
+library(dplyr)
+library(stringr)
+library(RColorBrewer)
+library(ggplot2)
+library(kableExtra)
+library(yardstick)
+library(readr)
+library(tidyr)
+library(tidyverse)
+#library(broom)
+library(coin)
+library(rpart)
+library(rpart.plot)
+library(lubridate)
+library(haven)
+library(readr)
+library(threejs)
+library(visNetwork)
+library(ggraph)
+```
+
+```{r}
+#загрузка данных
+load("~/shared/minor2_2020/data/good_read/books_g_3.RData")
+
+load("~/shared/minor2_2020/data/good_read/reviews_g_3.RData")
+
+```
+
+#### Текстовый анализ
+
+Текстовый анализ будет состоять из двух частей. В первой части будет проведен сентимент-анализ отзывов о каждом комиксе, а так же будет выделена единая эмоциональная оценка комикса. Вторая часть будет посвящена тематическому моделированию и присвоению комиксу номера темы для дальнейшего использования в создании рекомендательной системы.
+
+###### 1.1) Сентимент анализ отзывов о комиксах
+
+```{r}
+reviews <- goodread_reviews %>% right_join(goodread_comics) %>% select(book_id, review_text, rating) 
+reviews_tidy <- reviews %>% unnest_tokens(words, review_text, token = "words")
+```
+
+```{r}
+stop_words = data.frame(words=stopwords("en"), stringsAsFactors=FALSE)
+reviews_tidy_1 <- reviews_tidy %>% anti_join(stop_words)
+reviews_tidy_1$words <- lemmatize_words(reviews_tidy_1$words)
+```
+
+```{r}
+# используем словарь afinn
+sentdict = get_sentiments("afinn") 
+```
+
+```{r}
+new_tidy = reviews_tidy_1 %>% inner_join(sentdict, by = c("words"="word"))
+new_review_sent = new_tidy %>% 
+  group_by(book_id) %>% 
+  summarize(sent = mean(value))
+```
+
+Итак, мы использовали словарь afinn, чтобы получить сентимент оценку каждому комиксу. Затем мы усредняем эту оценку для каждого комикса. Именно этот показатель будет использован в дальнейшем в content-based системе.
+
+```{r}
+#добавляем колонку к общему датасету
+goodread_comics = goodread_comics %>% left_join(new_review_sent) 
+goodread_comics %>% select(title, sent) %>% arrange(-sent) %>% head()%>% kbl() %>% kable_styling()
+```
+
+###### 1.2) Тематическое моделирование описания комиксов
+
+```{r}
+library(topicmodels)
+comics <- goodread_comics  %>% select(book_id, description, average_rating) 
+comics_tidy <- comics %>% unnest_tokens(words, description, token = "words")
+comics_tidy <- comics_tidy %>% anti_join(stop_words)
+comics_tidy$words <- lemmatize_words(comics_tidy$words)
+
+```
+
+```{r}
+comics_tidy_1 = comics_tidy %>% group_by(book_id, words) %>% count()
+comics_dtm = cast_dtm(comics_tidy_1, book_id, words, n)
+ap_lda = LDA(comics_dtm, k = 10, control = list(seed = 1234))
+ap_documents = tidy(ap_lda, matrix = "gamma")
+ap_topics = tidy(ap_lda, matrix = "beta")
+```
+
+
+```{r}
+# теперь выделим для каждого комикса наиболее вероятную тему, к которой он может принадлежать
+doc_topic_set = ap_documents %>% group_by(document) %>% summarise(topic = topic[which(gamma == max(gamma))])
+doc_topic_set = doc_topic_set %>% rename(book_id = document)
+doc_topic_set$book_id = as.numeric(doc_topic_set$book_id)
+#doc_topic_set
+```
+
+Заметим, что здесь 483 документа, а в исходном датасете - 501, причиной может послужить (1) факт, что мы использовали лемматизацию для английских слов, а у некоторых комиксов в описании есть иероглифы, либо (2) - у комиксов попросту нет описания. Поэтому все такие комиксы мы определим в дополнительную категорию.
+
+```{r}
+#присоединяем топик к датасету
+goodread_comics = goodread_comics %>% left_join(doc_topic_set)
+goodread_comics$topic[is.na(goodread_comics$topic)] = 0
+```
+
+Можем так же посмотреть на наиболее часто встречающиеся слова в каждой теме
+
+```{r}
+review_top_terms <- ap_topics %>%
+  group_by(topic) %>%
+  top_n(5, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+review_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+```
+
+В некоторых темах уже по 5-ти словам можно понять, о чем этот топик. Например, в теме 8 слова Бэтмен и Готэм явно указывают на то, что документы этой темы объединены комиксами про Бэтмена. Аналогично, топик 4 посвящен человеку-пауку, а топик 7 - людям Х.
+
+###### Что будет включено в рекомендательной системе
+
+В ходе анализа отзывов и описаний комиксов были выделены 2 новых показателя: **средняя эмоциональность отзывов о комиксе** и  **принадлежность к одной из 11 тем**. Эти показатели будут использованы в дальнейшем при построении content-based рекомендательной системы.
+
+
+#### Сетевой анализ
+
+Теперь перейдем к анализу сети, построенной на основе нашего датасета. В нем мы рассмотрим разделение на кластеры, меры центральности, а так же визуализацию сети.
+
+###### Построение сети
+
+```{r message = FALSE, warning=FALSE, echo = F, include=FALSE}
+load("~/shared/minor2_2020/data/good_read/books_g_3.RData")
+load("~/shared/minor2_2020/data/good_read/reviews_g_3.RData")
+reviews=goodread_reviews
+books=goodread_comics
+library(recommenderlab)
+rm(goodread_comics)
+rm(goodread_reviews)
+```
+
+Создадим сеть на основе датасета reviews. Выводы, полученные при помощи анализа старой сети, будут не столь эффективны, чем выводы при анализе новой, поскольку последние будут более актуальны и будут соотноситься с выданными нам датасетами.
+
+```{r}
+# Создание матрицы смежности и сети
+r = reviews %>% dplyr::select(user_id, book_id, rating)
+r = pivot_wider(r, names_from = book_id, values_from = rating)
+user_names = r$user_id
+r = dplyr::select(r, - user_id)
+r = as.matrix(r)
+rownames(r) = user_names
+r = as(r, "realRatingMatrix")
+similarity = similarity(r, method = "cosine", which = "items")
+similarity = as.matrix(similarity)
+diag(similarity) = 1
+similarity = replace_na(similarity, 1)
+similarity_graph = 1 -similarity
+similarity_graph[similarity_graph >= 0.25] = 1
+similarity_graph[similarity_graph < 0.25] = 0
+similarity_graph = as.matrix.data.frame(similarity_graph)
+net = graph_from_adjacency_matrix(adjmatrix = similarity_graph, mode = "undirected")
+```
+
+```{r}
+nice = layout_nicely(net)
+V(net)$name = rownames(similarity)
+plot(net, vertex.label = NA, vertex.size = 4)
+```
+
+Сеть выглядит интересно, однако полумесяц данных вызывает опасения по поводу эффективности кластеризации. Посмотрим, что скажет кластеризация сети и модулярность.
+
+###### Модулярность сети
+
+Мы рассмотрим такие методы кластеризации, как: fast greedy, walktrap, label propagation, eigenvector, multilevel, infomap. Ниже представлены результаты модулярности по этим методам:
+```{r}
+for(method in list(fastgreedy.community,walktrap.community,label.propagation.community,leading.eigenvector.community,multilevel.community,infomap.community)){
+  modul = modularity(method(net))
+  print(modul)
+}
+```
+
+```{r}
+#Label Propagation
+lpcommune=label.propagation.community(net)
+lpcommune_m=modularity(lpcommune)
+#Walktrap
+wtcommune=walktrap.community(net, steps=5)
+wtcommune_m=modularity(wtcommune)
+#Information Map
+imcommune=infomap.community(net, nb.trials=5)
+imcommune_m=modularity(imcommune)
+#Fast Greedy
+fgcommune = fastgreedy.community(net)
+fgcommune_m=modularity(fgcommune)
+#Multilevel 
+mlcommune=multilevel.community(net)
+mlcommune_m=modularity(mlcommune)
+```
+
+Модулярность оказалась не столь высокой, как полученная нами при анализе старой сети в домашних заданиях и при подготовке к групповому (максимум 0.57 у метода Multilevel). Скорее всего, это обсулавливается полумесяцем из данных на графике. Посмотрим на графиках, какая вышла кластеризация сети на сообщества.
+
+
+```{r}
+#Multilevel Modularity - 273 сообщества
+plot(mlcommune, net,
+vertex.label.color = "black",
+vertex.label.cex = 0.006,
+vertex.size = 2,
+edge.color = 'gray',
+main = "Разбиение с помощью Multilevel",
+layout = nice)
+
+#Information Map Modularity - 289 сообществ 
+plot(imcommune, net,
+vertex.label.color = "black",
+vertex.label.cex = 0.006,
+vertex.size = 2,
+edge.color = 'gray',
+main = "Разбиение с помощью Information Map",
+layout = nice)
+
+#Walktrap Modularity - 303 сообщества
+plot(wtcommune, net,
+vertex.label.color = "black",
+vertex.label.cex = 0.006,
+vertex.size = 2,
+edge.color = 'gray',
+main = "Разбиение с помощью Walktrap",
+layout = nice)
+```
+
+Всё верно, огромное количество сообществ объясняется полумесяцем - данные разрознены, что заставляет выделить их в отдельные группы, и минимум 2/3 всех кластеров находятся в полумесяце.
+
+
+###### Распределение комиксов по кластерам
+Посмотрим количество представителей у каждого кластера по методу Multilevel
+
+```{r}
+membership = membership(mlcommune)
+books$commune = membership
+```
+
+```{r}
+books %>% 
+  count(commune) %>% 
+  top_n(15, n) %>% 
+  ggplot(aes(x = reorder(commune, n), y = n))+
+  geom_col()+
+  theme_classic()+
+  coord_flip()+
+  geom_text(aes(label = n,  hjust = -0.1))+
+  labs(y = "Число комиксов в кластере", x = "Номер кластера")
+
+```
+
+Итого, у нас 11 кластеров, где сгрупированно более 2 произведений, остальные 260 с лишним кластеров включают в себя от одного до двух комиксов. Самые крупные кластеры - 204 с 45 комиксами и 206 с 35 комиксами. Следующие три крупных - 263, 218 и 235 с количеством комиксов 26, 25 и 23 соответственно. Далее три кластера по 18 комиксов (269, 236, 182).
+Проверим ассортативность распределения по кластерам
+
+```{r}
+#сообщество делаем фактором, так как это дискретная величена
+V(net)$commune=books$commune
+assortativity_nominal(net, as.factor(V(net)$commune), directed = F)
+```
+
+Ассортативность равна 0.79, что означает высокую связь между способом распределения на кластеры, данным multilevel.community, и оценкой пользователей. Найдем самый центральный комикс для каждого кластера по betweenness. 
+
+```{r}
+net$community = membership
+communities = data.frame() 
+for (i in unique(net$community)) { 
+
+subgraph = induced_subgraph(net, v = which(net$community == i)) 
+
+size = igraph::gorder(subgraph) 
+
+btwn = betweenness(subgraph) 
+communities = communities %>% 
+    bind_rows(data.frame(
+    community = i, 
+    n_characters = size, 
+    most_important = names(which(btwn == max(btwn)))
+    ) 
+  ) 
+communities = communities %>% arrange(-n_characters)
+} 
+```
+
+```{r}
+important = list()
+for(i in communities$most_important){
+  name = books$title[books$book_id == i]
+  important = important %>% append(name)
+}
+communities$label = do.call(cbind.data.frame, important) %>% t()
+communities = communities %>% dplyr::select(-most_important)
+head(communities,10)%>% kbl() %>% kable_styling()
+```
+
+Кластер 204 - Vertigo - Marzi
+
+Кластер 206 - DC Comics - Batwoman: Elegy
+
+Кластер 263 - Bloomsbury USA Childrens - Calamity Jack (Rapunzel's Revenge, #2)
+
+Кластер 218 - DC Comics - Superman: Sacrifice
+
+Кластер 235 - Unknown - Trinity Blood, Vol. 1
+
+Кластер 236 - Image Comics - Saga, Vol. 1 (Saga, #1)
+
+Кластер 269 - BOOM! - Lumberjanes To The Max Edition, Vol. 1
+
+Кластер 182 - Marvel - New X-Men by Grant Morrison Ultimate Collection - Book 1
+
+И мы снова видим, что почти половину топ-10 занимают первые части комиксов или манг, однако столь же важно заметить, что в топе новой сети гораздо больше независимых комиксов, которые выпускались одной частью (либо номер части не написан)
+
+###### Меры центральности
+
+Посмотрим на центральные комиксы новой сети. Будем использовать такие меры центральности, как degree, betweenness, eigen vector. Итого:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Наиболее популярный комикс по degree - количеству путей, проходящих через узел
+degree = data.frame(tibble::enframe(degree(net)) %>% arrange(-value))
+#head(degree,10) %>% kbl() %>% kable_styling()
+
+#id23735609 со значением 28 - "The Boy Who Crashed to Earth (HiLo #1)"
+#books$title[books$book_id == 23735609]
+
+#Наиболее популярный комикс по betweenness
+options(scipen = 9999)
+btw = data.frame(tibble::enframe(round(betweenness(net), 2)) %>% arrange(-value))
+#head(btw,10)%>% kbl() %>% kable_styling()
+#id6911529 со значением 4711.13 - "Batwoman: Elegy"
+#books$title[books$book_id == 6911529]
+
+#Наиболее популярный комикс по eigen centrality
+eigen = data.frame(tibble::enframe(round(eigen_centrality(net)$vector, 2)) %>% arrange(-value))
+#head(eigen,10)%>% kbl() %>% kable_styling()
+#id23735609 - "The Boy Who Crashed to Earth (HiLo #1)"
+#books$title[books$book_id == 23735609]
+```
+
+
+Наиболее центральный комикс по degree - количеству путей, проходящих через узел - "The Boy Who Crashed to Earth (HiLo #1)" со значением 28
+
+Наиболее центральный комикс по betweenness - "Batwoman: Elegy" со значением 4711.13
+
+Наиболее центральный комикс по eigen centrality - "The Boy Who Crashed to Earth (HiLo #1)"
+
+Стоит заметить, что если в старой сети максимальное значение degree было 109, то в новой сети - всего лишь 28.
+
+Рассмотрим, насколько сильно отличаются результаты degree, betweenness и eigen centrality, а именно, рассмотрим их корреляцию и топ10 по каждому параметру
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Заивисимость между переменными degree, betweenness и eigen centrality
+DtoB=str_c("degree-betweenness: ",round(stats::cor(degree(net), betweenness(net)),2))
+DtoE=str_c("degree-eigen_centrality: ",round(stats::cor(degree(net), eigen_centrality(net)$vector),2))
+EtoB=str_c("eigen_centrality-betweenness: ",round(stats::cor(eigen_centrality(net)$vector, betweenness(net)),2))
+```
+
+Можно выделить очень высокую корреляцию между degree и eigen centrality - 0.9, менее высокую между degree и betweenness - 0.66, и низкую корреляцию между eigen centrality и betweenness - 0.38. Посмотрим, видно ли в топ10 по трем мерам центральности данную корреляцию.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+top_center = data.frame(degree["name"], btw["name"], eigen["name"])
+colnames(top_center) = c("degree", "betweenness", "eigen_centrality")
+top_center = top_center[1:10, ]
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Найдем для каждого id название комикса в соответствии с используемой функцией
+degree_label = list()
+for(i in top_center$degree){
+  title = books$title[books$book_id == i]
+  degree_label = degree_label %>% append(title)
+}
+
+btw_label = list()
+for(i in top_center$betweenness){
+  title = books$title[books$book_id == i]
+  btw_label = btw_label %>% append(title)
+}
+
+eigen_label = list()
+for(i in top_center$eigen_centrality){
+  title = books$title[books$book_id == i]
+  eigen_label = eigen_label %>% append(title)
+}
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Поставим все названия в один датасет, уберем id
+top_center$degree_label = degree_label
+top_center$btw_label = btw_label
+top_center$eigen_label = eigen_label
+top_center = top_center[ , 4:6]
+colnames(top_center) = c("degree", "betweenness", "eigen_centrality")
+#Изменим формат для вывода и поменяем формат из рядов в колонки
+top_center$degree =  do.call(cbind.data.frame, degree_label) %>% t()
+top_center$betweenness =  do.call(cbind.data.frame, btw_label) %>% t()
+top_center$eigen_centrality =  do.call(cbind.data.frame, eigen_label) %>% t()
+#Сам вывод
+top_center[, 1:3]%>% kbl() %>% kable_styling()
+```
+
+Корреляция очевидна: у degree и eigen centrality много одинаковых комиксов, betweenness же отличается своим набором топ10 как от degree, так и от eigen centrality, разве что от последнего отличается больше - например, в degree и betweenness есть комикс Brain Camp, который отсутствует в топ 10 по eigen centrality.
+
+И мы снова видим множество первых частей, а также уже известных нам и центральных в своих кластерах Marzi и Batwoman: Elegy.
+
+
+Интересно, какие комиксы самые популярные в нашей сети по количеству отзывов?
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+books$ratings_count = as.numeric(books$ratings_count)
+
+temp_data = books %>% arrange(desc(ratings_count)) %>%   top_n(5, ratings_count)
+temp_data$title <- str_wrap(temp_data$title, width = 25)
+temp_data = temp_data %>% mutate(max_score=case_when(
+  ratings_count == max(ratings_count) ~ "m",
+  TRUE ~ "0"
+))
+
+ggplot(data = temp_data) + geom_bar(aes(x = title, y = ratings_count, fill = max_score), stat = 'identity', show.legend = FALSE)+  
+coord_flip()+ scale_y_continuous(labels = scales::comma)+theme_bw()+ggtitle('Топ5 популярных комиксов по количествам отзывов') +ylab("Количество отзывов")+theme(axis.title.y = element_blank()) +
+  scale_fill_manual(values=c("m" = "red", "0" = "gray"))
+```
+
+Очевидно, что это Saga, Часть Первая, хотя по какой-то причине существует две книги с таким названием - возможно, ошибка системы отзывов goodreads, поскольку комикс тот же, различие лишь в способе названия номера части. При этом примечательно, что оба комикса являются единственными комиксами, на которые было дано более ста тысяч отзывов.
+
+А сможем ли мы увидеть сообщества комиксов с похожими оценками на графике?
+
+```{r}
+#Упорядочиваем датасет
+vertices = data.frame(book_id = as.numeric(V(net)$name))
+vertices = left_join(vertices, books)
+books = vertices
+```
+
+```{r}
+# Добавление аттрибутов к сети
+books$average_rating = as.numeric(books$average_rating)
+books$ratings_count = as.numeric(books$ratings_count)
+books$num_pages = as.numeric(books$num_pages)
+books$authors.0.author_id = as.numeric(books$authors.0.author_id)
+books$authors.1.author_id = as.numeric(books$authors.1.author_id)
+books$book_id = as.numeric(books$book_id)
+V(net)$author_0 = books$authors.0.author_id
+V(net)$author_1 = books$authors.1.author_id
+V(net)$mean_rate = books$average_rating
+V(net)$n_pages = books$num_pages
+V(net)$popularity = books$ratings_count
+V(net)$shelf_0 = books$popular_shelves.0.name
+V(net)$popular_shelves.1.name = books$popular_shelves.1.name
+V(net)$shelf_2 = books$popular_shelves.2.name
+V(net)$shelf_3 = books$popular_shelves.3.name
+V(net)$publisher = books$publisher
+V(net)$name = books$book_id
+```
+
+Визуализируем ту часть сети, где наибольшая центральность (betweenness)
+```{r}
+#Визуализация части сети, где центральность наибольшая
+g = induced_subgraph(net, degree(net)>15)
+ggraph(g)+
+  geom_node_point(size = betweenness(g))+
+  geom_edge_link(alpha = 0.7)+
+  geom_node_label(aes(label = name))+
+  ggtitle("Репрезентация части сети, \nгде ноды с наибольшей центральностью")+
+  theme_graph()
+```
+
+
+А сможем ли мы увидеть на графике сообщества комиксов, которые похожи не только по оценкам, но и по жанру?
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# https://datastorm-open.github.io/visNetwork/
+library(visNetwork)
+
+# конвертируем данные из формата igraph в формат visNetwork
+net2 <- toVisNetworkData(net)
+
+
+# подписи при наведении
+net2$nodes$title = net2$nodes$title
+
+visNetwork(nodes = net2$nodes, edges = net2$edges, height = "1600px", width = "2400px") %>% 
+  visIgraphLayout()%>%
+  visOptions(selectedBy = "popular_shelves.1.name", 
+             highlightNearest = TRUE, 
+             nodesIdSelection = FALSE) %>%
+  visPhysics(stabilization = FALSE) %>% visNodes()
+
+```
+  
+Из графика видно, что сообществ комиксов по жанру с похожими оценками в принципе нет, они все рассеяны по сети. Для проверки, есть ли какая-либо логика в этом распределении, посмотрим коэффициент ассортативности.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+V(net)$popular_shelves.1.name = factor(books$popular_shelves.1.name)
+assortativity_nominal(net, V(net)$popular_shelves.1.name, directed = F)
+```
+Коэффициент ассортативности равен 0.02, что означает, что отсутствует даже слабая связь между жанром комикса и оценкой пользователей.
+
+
+Также мы можем посмотреть на распределение по издателю-вселенной:
+
+```{r}
+load("~/shared/minor2_2020/data/good_read/books_g_3.RData")
+goodread_comics %>% group_by(publisher) %>% count() %>% arrange(-n)
+```
+
+Значительную часть занимают Марвел, DC и Image Comics. Так как one-hot-encoding по всем издателям добавит более 100 новых колонок, мы сделаем 3 колонки, где будет отображено, является ли комикс Марвел, DC, Image Comics или ни одним из перечисленных.
+
+###### Выводы для рекомендательной системы: к сожалению, несмотря на большое количество выводов, немногие из них применимы для рекомендательной системы
+
+1) Большинство комиксов принадлежат Марвел, DC и Image Comics
+
+2) Центральные позиции зачастую принадлежат комиксам - первым частям
+
+3) Центральные комиксы - The Boy Who Crashed to Earth (HiLo #1); Batwoman: Elegy; Marzi; Log Horizon, Vol. 1 (Log Horizon Manga, #1); Last Man: The Stranger (Last Man. #1); New X-Men by Grant Morrison Ultimate Collection - Book 1
+
+4) Крупных кластеров всего ~10 из 273, остальные состоят из одного-двух комиксов
+
+5) Наиболее популярный комикс по количеству отзывов - Saga, Vol. 1, причем дважды 
+
+Выделить первые части - затруднительно, так как где-то она указана, где-то нет, где-то комикс состоит в целом из одной части. Поэтому мы добавим к исходным данным только колонки о вселенных.
+
+Добавим все колонки с информацией, выявленной в ходе двух анализов.
+
+```{r}
+#так как DC владеет Verigo, учтем их вместе
+dc = ifelse(goodread_comics$publisher == "DC Comics" | goodread_comics$publisher == "Vertigo" , 1, 0)
+marvel = ifelse(goodread_comics$publisher == "Marvel" | goodread_comics$publisher == "Marvel Comics", 1, 0)
+image_comics = ifelse(goodread_comics$publisher == "Image Comics", 1, 0)
+```
+
+```{r}
+#### Итоговый датасет для content-based рекомендательной системы:
+goodread_comics$marvel = marvel
+goodread_comics$dc = dc
+goodread_comics$image_comics = image_comics
+goodread_comics = goodread_comics %>% left_join(doc_topic_set)
+goodread_comics$topic[is.na(goodread_comics$topic)] = 0
+goodread_comics = goodread_comics %>% left_join(new_review_sent) 
+mean_rating = reviews %>% group_by(book_id) %>% summarize(rating = mean(rating))
+goodread_comics = goodread_comics %>% left_join(mean_rating)
+```
+
+
+
+Так как в методе коллаборативной фильтрации используются исключительно рейтинги фильмов, проставленные пользователями, вышенаписанный анализ понадобится нам при написании content-based системы. Перейдем непостредственно к системам. 
+
+
+### Коллаборативная фильтрация
+
+Методом был выбран IBCF, то есть фильтрация основывается на комиксах.
+
+```{r}
+#оставляем только оценки пользователей и книги
+load("~/shared/minor2_2020/data/good_read/reviews_g_3.RData")
+goodread_reviews_cf = select(goodread_reviews, -review_id, -date_added,-review_text)
+
+#Преобразуем к таблице в "широком" формате
+rates = pivot_wider(goodread_reviews_cf, names_from = book_id, values_from = rating)
+```
+
+
+**Примечание:** на первый взгляд может показаться странным, что мы не убираем пользователей с маленьким количеством оценок, однако после нескольких проверенных вариантов вручную, начальные данные дают ошибку MAE примерно 0.92, в то время как при фильтрации по количеству оценок ошибка варьируется в диапозоне 1.10 - 1.20. Поэтому мы оставим датасет в исходном виде.
+
+```{r}
+#преобразуем в объект realRatingMatrix и фильтруем по количеству оценок
+userNames = rates$user_id
+rates = select(rates, -user_id)
+rates = as.matrix(rates)
+rownames(rates) = userNames
+r = as(rates, "realRatingMatrix")
+ratings_books <- r[rowCounts(r) > 0, colCounts(r) > 0]
+```
+
+
+
+```{r}
+#строим модель оценивания
+set.seed(100)
+eval_sets <- evaluationScheme(data = ratings_books,
+method = "split",
+train = 0.8, # доля обучающей выборки
+given = 1, # сколько оценок используется для предсказания
+goodRating = 4) # если предсказанная оценка < 4, то фильм не рекомендуем
+```
+
+```{r}
+recc_model_ibcf <-
+Recommender(data = getData(eval_sets, "train"), method = "IBCF")
+recc_predicted_ibcf <-
+predict(
+object = recc_model_ibcf,
+newdata = getData(eval_sets, "known"),
+n = 6,
+type = "ratings"
+)
+```
+
+
+###### Формальное оценивание - этот вид оценивания предшествует остальным и методам и функции, так как необходимо получить примерное представление о качестве рекомендаций на начальном этапе.
+
+```{r}
+eval_accuracy2 <- calcPredictionAccuracy(x = recc_predicted_ibcf,
+# predicted values
+data = getData(eval_sets, "unknown"),
+byUser = F)
+eval_accuracy2
+```
+
+Система в среднем ошибается на 0.92 балла. Однако этого недостаточно, чтобы наверняка сказать, хорошо работает алгоритм или нет. Проведем еще 2 этапа оценивания, предварительно обернув все в функцию.
+
+```{r}
+#строим теперь уже общую модель для всех юзеров
+recc_model <- Recommender(data = ratings_books, method = "IBCF")
+```
+
+Теперь для автоматизации получения рекомендаций "обернем" код в функцию.
+
+```{r}
+comics_function_CF = function(user_id, n_comics){
+  recc_predicted = predict(object = recc_model, newdata = ratings_books, n = n_comics)
+  recc_user <- recc_predicted@items[[user_id]]
+ if (length(recc_user)==0) {
+  rec = goodread_comics %>% arrange(-rating) %>% top_n(n_comics)%>% select(title, rating, publisher, description) 
+  rec = knitr::kable(rec, col.names = c("Похожий комикс", "Средняя оценка","Вселенная", "Описание")) %>% kable_styling()
+ } else {
+  comics_user <- recc_predicted@itemLabels[recc_user]
+  names_comics_user <- goodread_comics$title[match(comics_user, goodread_comics$book_id)]
+  rec = data.frame(comics = names_comics_user, book_id = as.numeric(comics_user)) %>% left_join(goodread_comics) %>% select(title, rating, publisher, description)
+  rec = knitr::kable(rec, col.names = c("Похожий комикс", "Средняя оценка","Вселенная", "Описание")) %>% kable_styling()
+ }
+ rec
+}
+```
+
+**Описание функции:** данная функция принимает на вход id пользователя и количество комиксов, которое он/она хочет получить в качестве рекомендации. Если пользователь новый, то ему нужно указать только количество комиксов - тогда система выдаст ему список комиксов с наивысшей средней оценкой.
+
+#### Примеры
+
+###### Для существующего пользователя
+
+```{r}
+comics_function_CF("f8019b36ddc20e8062a4260851a1efe0", 2) 
+```
+
+###### Для нового пользователя
+
+```{r}
+comics_function_CF(n_comics = 2) 
+```
+
+**Оценивание рекомендации:** теперь попробуем оценить качество рекомендации еще некоторыми способами.
+
+#### Проверка на адекватность + Внутренняя пользовательская оценка
+
+Здесь мы соединим 2 похожих способа оценивания. Для этого выберем рандомно 3ех пользователей, посмотрим на их реальные предпочтения - любимые комиксы, их вселенные, описание, а также предположим, что мы бы хотели получить в качестве рекомендации, будучи на месте данного пользователя. Затем порекомендуем им несколько комиксов и сравним визуально схожесть с истинными значениями и качество рекомендаций.
+
+Для начала получим список из минимум 5 любимых комиксов(их может быть больше, так как могут быть комиксы, оцененные одинаково). Для первого пользователя:
+
+```{r}
+top5_1 = filter(goodread_reviews, user_id == "85b04c6415a88bdc0a48da3df74767b2") %>% 
+  top_n(5, rating) %>% inner_join(goodread_comics, by = "book_id")
+
+goodread_comics %>% filter(goodread_comics$book_id %in% top5_1$book_id) %>% select(title, publisher)%>% kbl() %>% kable_styling()
+```
+
+Видно, что пользователь - фанат DC и Бэтмена  в частности. Следовательно, ожидаем получить от системы комиксы DС или Вертиго, а так же Бэтмена/Бэтвумен.
+
+То же самое для второго и третьего.
+
+```{r}
+top5_2 = filter(goodread_reviews, user_id == "f8019b36ddc20e8062a4260851a1efe0") %>% 
+  top_n(5, rating) %>% inner_join(goodread_comics, by = "book_id")
+
+goodread_comics %>% filter(goodread_comics$book_id %in% top5_2$book_id) %>% select(title, publisher)%>% kbl() %>% kable_styling()
+```
+
+Этот пользователь не имеет любимый тип комиксов или вселенную, но можно заметить, что есть комиксы DC, Dark Horse, их и ожидаем получить в качестве рекомендации.
+
+```{r}
+top5_3 = filter(goodread_reviews, user_id == "d286122fed6ded84ff53993335bfd59c") %>% 
+  top_n(5, rating) %>% inner_join(goodread_comics, by = "book_id")
+
+goodread_comics %>% filter(goodread_comics$book_id %in% top5_3$book_id) %>% head() %>% select(title, publisher)%>% kbl() %>% kable_styling() 
+```
+Третий пользователь имеет много одинаково оцененных комиксов. Среди вселенных можно отметить DС и Image Comics. Если смотреть на названия комиксов, то есть несколько комиксов C.O.W.L и Бэтмена. 
+
+###### Первый пользователь
+
+```{r}
+goodread_comics %>% filter(goodread_comics$book_id %in% top5_1$book_id) %>% select(title, publisher)%>% kbl() %>% kable_styling()
+```
+
+
+```{r}
+comics_function_CF("85b04c6415a88bdc0a48da3df74767b2", 5)
+```
+
+По этому пользователю результат - рекомендация не очень хорошая, почти нет совпадений ни по названиям, ни по вселенным. 
+
+###### Второй пользователь
+
+```{r}
+goodread_comics %>% filter(goodread_comics$book_id %in% top5_2$book_id) %>% select(title, publisher)%>% kbl() %>% kable_styling()
+```
+
+```{r}
+comics_function_CF("f8019b36ddc20e8062a4260851a1efe0", 5)
+```
+
+Здесь результат получше: странным выглядит только 4-ая рекомендация, так как ни похожих названий, ни вселенной в предпочтениях пользователя нет. В остальном, мы так же рекомендуем ему Марвел(по типу комиксов Марвел схож с DC) и Vertigo, и другой комикс Girls от Image Comics, в этих показателях рекомендация удачна, то есть ожидания оправданы. Проверим последнего пользователя.
+
+###### Третий пользователь
+
+```{r}
+goodread_comics %>% filter(goodread_comics$book_id %in% top5_3$book_id) %>% head() %>% select(title, publisher)%>% kbl() %>% kable_styling()
+```
+
+```{r}
+comics_function_CF("d286122fed6ded84ff53993335bfd59c", 5)
+```
+
+Здесь качество рекомендации среднее. "Попаданием" можно считать первый комикс(комикс про Джейсона Тодда и Бэтмена) и последний(комикс про Чудо-Женщину).
+
+###### Промежуточный итог по системе коллаборативной фильтрации 
+
+После оценивания первой рекомендательной системы можно сделать следующий вывод: система работает "средне", при проверке  рекомендации на 3-ех пользователях качество было оценено, как плохое-среднее-хорошее, то есть у всех трех пользоватлелей качество было разное. В целом, система может рекомендовать комиксы читателям.
+
+Теперь перейдем ко второй системе - content-based.
+
+### Content-based рекомендация
+
+Для начала уберём из датасета лишние переменные. 
+
+```{r}
+goodread_comics2 = goodread_comics %>% dplyr::select( book_id, average_rating, publication_year, marvel, dc, image_comics, sent, topic, rating)
+```
+
+В рекомендательной системе мы будем использовать:
+ * Средний рейтинг с сайта
+ * Год публикации
+ * Принадлежность к одной из трёх крупных вселенных (издательств)
+ * Результаты sentiment-анализа
+ * Выделенные LDA темы 
+ * Средний рейтинг посчитанный на данных из датасета с отзывами
+ 
+ 
+ Сохраняем ID книг в названиях строк и убираем ID из датасета. Меняем тип оставшихся переменных на numeric и считаем косинусное расстояние. Не забываем заменить диагональ в матрице на нули. 
+
+```{r}
+goodread_comics2 = goodread_comics2 %>% column_to_rownames(., var = "book_id")
+
+
+goodread_comics2$average_rating  <- as.numeric(goodread_comics2$average_rating )
+goodread_comics2$publication_year  <- as.numeric(goodread_comics2$publication_year )
+
+simcb = lsa::cosine(t(as.matrix(goodread_comics2)))
+diag(simcb) = 0
+
+```
+
+Теперь посмотрим один пример рекомендации.
+
+Берём id случайного пользователя, ищем книги, которые он оценил на 5 и находим самую похожую на них. 
+
+```{r}
+#load("~/shared/minor2_2020/data/good_read/reviews_g_3.RData")
+
+usercb = goodread_reviews %>% filter(user_id == "85b04c6415a88bdc0a48da3df74767b2" & rating == 5)
+usercb %>% 
+  select(book_id, user_id, rating) #выводит список комиксов, которые он оценил на 5
+simCutcb = simcb[,as.character(usercb$book_id)]
+mostSimilarcb = max(simCutcb, na.rm = T)
+b = which(simCutcb == mostSimilarcb, arr.ind = TRUE)
+#b
+result = rownames(b)
+filter(goodread_comics,book_id %in% result) %>% dplyr::select(title)%>% kbl() %>% kable_styling()
+```
+
+А можем этому же пользователю порекомендовать не один комикс, а например 6. 
+
+```{r}
+mostSimilarcb = head(sort(simCutcb, decreasing = T), n = 6)
+mostSimilarcb
+b = which(simCutcb %in% mostSimilarcb, arr.ind = TRUE, useNames = T)
+index = arrayInd(b, .dim = dim(simcb))
+#index
+#index[,1]
+# id комиксов
+result = rownames(simcb)[index[,1]]
+# result содержит id рекомендуемых книг
+filter(goodread_comics,book_id %in% result) %>% dplyr::select(title, book_id)%>% kbl() %>% kable_styling()
+```
+
+Так как каждый раз вручную менять пользователя неудобно, все это можно обернуть в фунцкии. Для этой системы будет написано 2 функции: одна работает с id пользователя, другая непосредственно с комиксом. **Было принято решение написать вторую функцию, так как это позволит новым пользователям(как и старым) получить рекомендацию, несмотря на то что их нет в базе данных**. Каждая функции будет отличаться входными данными. 
+
+###### user_function
+
+```{r}
+user_function = function(n_comics, id){
+  if (missing(id)) {
+    rec = goodread_comics %>% arrange(-rating)%>% top_n(n_comics) %>% select(title, rating, publisher, description) 
+    rec = knitr::kable(rec, col.names = c("Попробуйте эти комиксы!", "Средняя оценка", "Вселенная", "Описание")) %>% kable_styling()
+  } else{
+    user = goodread_reviews %>% filter(user_id == id) %>% arrange(-rating) %>% top_n(n = 5, wt = rating)
+    simCut = simcb[,as.character(user$book_id)]
+    mostSimilar = head(sort(simCut, decreasing = T), n = n_comics)
+    a = which(simCut %in% mostSimilar, arr.ind = TRUE, useNames = T)
+    index = arrayInd(a, .dim = dim(simcb))
+    result = rownames(simcb)[index[,1]]
+    mostSimilar = data.frame("book_id" = as.numeric(result),
+                             "similar" = simCut[index])
+    
+    rec = mostSimilar %>% left_join(goodread_comics) %>% select(book_id, title, similar, average_rating, publisher, description) %>% arrange(-similar) %>%select(-similar, -book_id)
+    rec = knitr::kable(rec %>% distinct(), col.names = c("Рекомендуемый комикс", "Средняя оценка", "Вселенная", "Описание")) %>% kable_styling()
+  }
+  rec
+}
+```
+
+###### Описание функции:
+
+1) Вводные данные: количество комиксов, которое пользователь хочет получить в качестве рекомендации, пользовательский id, если его нет- нужно заполнить только первый параметр.
+
+2) Так как не у каждого пользователя есть оценки 5, мы заменили это списком из 5-ти самых высокорейтинговых комиксов для конкретного пользователя.
+
+3) На выходе пользователь получает количество комиксов в качестве рекомендации, их средняя оценка, вселенная и описание.
+
+4) Предыдущий пункт актуален для существующего пользователя, новому мы рекомендуем N наиболее рейтинговых комиксов с тем же набором информации.
+
+#### Примеры:
+
+###### Пример функции для существующего пользователя.
+
+```{r}
+user_function(2, "85b04c6415a88bdc0a48da3df74767b2")
+```
+
+
+######  Пример функции для нового пользователя.
+
+```{r}
+user_function(1)
+```
+
+###### comics_function
+
+```{r}
+comics_function = function(comics_name, n_comics){
+    id = goodread_comics %>% filter(title == comics_name) %>% select(book_id)
+  if(nrow(id) == 0){
+    recommend = "Такого комикса нет, пожалуйста,попробуйте ввести другой!"
+  } else{
+    mostSimilar = head(sort(simcb[,as.character(id)], decreasing = T), n = n_comics)
+    mostSimilar = data.frame(similar = mostSimilar)
+    mostSimilar$book_id = as.numeric(rownames(mostSimilar))
+    recommend = mostSimilar %>% left_join(goodread_comics) %>% select(book_id, title, similar, rating, publisher, description) %>% arrange(-similar) %>% select(title, rating, publisher, description)
+    recommend = knitr::kable(recommend, col.names = c("Похожий комикс", "Средняя оценка","Вселенная", "Описание")) %>% kable_styling()
+  }
+    recommend
+}
+```
+
+###### Описание:
+
+1) Вводные данные: количество комиксов, которое пользователь хочет получить в качестве рекомендации, название комикса, на основе которого будет рекомендация
+
+2) Если такого комикса нет, будет появляться соответсвующее сообщение.
+
+3) На выходе пользователь получает количество комиксов в качестве рекомендации, их средняя оценка, вселенная и описание.
+
+4) Предыдущий пункт актуален как для существующего пользователя, так и для нового.
+
+#### Примеры:
+
+###### Пример для существующего комикса.
+
+```{r}
+comics_function("House of M", 2)
+```
+
+###### Пример для несуществующего комикса.
+
+```{r}
+comics_function("Путина не выбрали президентом")
+```
+
+Следующий этап - оценивание качества рекомендаций.
+
+**Оценивание рекомендации:** для этого использовались внутренняя пользовательская оценка и проверка на адекватность.
+
+###### Внутренняя пользовательская оценка
+
+Начнем с собственных входных данных. Предположим, мы прочитали какой-то комикс, он нам понравился, и мы хотим прочитать что-то похожее. 
+
+###### Первый сценарий
+
+В качестве первого примера возьмем комикс про Ходячих Мертвецов и попросим систему порекомендовать нам 4 комикса. В качестве аутпута ожидаем хотя бы несколько комиксов про тех же ходячих мертвецов или комиксы, похожие по описанию на них(если такие вообще имеются).
+
+```{r}
+comics_function("The Walking Dead, Issue #140", 4)
+```
+
+Получили ожидаемый в данном случае результат. В качестве рекомендации к ХМ система возвращает нам другие части Ходячих, что довольно логично. Однако это всего лишь 1 пример, попробуем другой комикс.
+
+###### Второй сценарий
+
+Та же логика, но для Мстителей. Что будет, если мы - фанаты комиксов про Мстителей и хотим получить рекомендации? Ожидаем получить что-то от Марвел как минимум.
+
+```{r}
+comics_function("The New Avengers, Volume 2", 4)
+```
+
+В этот раз комиксы Марвел здесь подобраны хорошо, так как это, например, Люди Х, которые похожи на Мстителей "командой". Проверим еще один комикс.
+
+###### Третий сценарий
+
+Допустим, пользователь - любитель комиксов про Женщину-Кошку. В этот раз ожидаем получить что-то из Марвел, в частности комиксы про Человека Паука.
+
+```{r}
+comics_function("Spider-Women",4)
+```
+
+
+В этот раз система так же рекомендует комиксы нужной вселенной, а так же конкретно Человека-Паука. То есть рекомендацию можно назвать удачной.
+
+**Вывод:** данный способ оценивания системы показал, что в целом, система работает неплохо, ищет логичные закономерности, однако так же и ошибается, что понятно, так как в базе имеет лишь 500 комиксов. Попробуем еще способ оценить системы.
+
+
+#### Проверка на адекватность
+
+Теперь вернемся к юзерам и их предпочтениям. Посмотрим на рекомендации некоторым пользователям и сравним их с "настоящими" предпочтениями.
+
+###### Первый сценарий
+
+Возьмем рандомного пользователя, найдем его 5 любимых комиксов, их названия и вселенную.
+
+```{r}
+top5_1 = filter(goodread_reviews, user_id == "85b04c6415a88bdc0a48da3df74767b2") %>% 
+  top_n(5, rating) %>% inner_join(goodread_comics, by = "book_id")
+
+goodread_comics %>% filter(goodread_comics$book_id %in% top5_1$book_id) %>% select(title, publisher)%>% kbl() %>% kable_styling()
+```
+
+Сравним с рекомендацией.
+
+```{r}
+user_function(5, "85b04c6415a88bdc0a48da3df74767b2")
+```
+
+Рекомендации хорошие. Четкое совпадение по вселенным(DC и Вертиго), а так же рекомендация конкретно Бэтмена, Бэтгерл и Супермена(последние 2 напрямую связаны с первым).
+
+###### Второй сценарий
+
+Еще один пользователь:
+
+```{r}
+top5_2 = filter(goodread_reviews, user_id == "f8019b36ddc20e8062a4260851a1efe0") %>% 
+  top_n(5, rating) %>% inner_join(goodread_comics, by = "book_id")
+
+goodread_comics %>% filter(goodread_comics$book_id %in% top5_2$book_id) %>% select(title, publisher)%>% kbl() %>% kable_styling()
+```
+
+Видно, что любимые серии для этого пользователя - B.P.R.D, а вселенная Dark Horse, а так же DC Comics, сами комиксы все разные, закономерности не видно. Смотрим на рекомендации.
+
+```{r}
+user_function(5, "f8019b36ddc20e8062a4260851a1efe0")
+```
+
+Здесь рекомендация сработала относительно не очень.Неточное попадание и по вселенным, и по конкретным комиксам. И проверим еще одного пользователя.
+
+###### Третий сценарий
+
+```{r}
+top5_3 = filter(goodread_reviews, user_id == "d286122fed6ded84ff53993335bfd59c") %>% 
+  top_n(5, rating) %>% inner_join(goodread_comics, by = "book_id")
+
+goodread_comics %>% filter(goodread_comics$book_id %in% top5_3$book_id) %>% head() %>% select(title, publisher)%>% kbl() %>% kable_styling()
+```
+
+Опять попались на фаната DC и Vertigo. Любимые комиксы зачастую - Бэтмен, C.O.W.L, Jack of Fables. 
+
+```{r}
+user_function(5, "d286122fed6ded84ff53993335bfd59c")
+```
+
+Рекомендации сработали относительно неплохо. Мы рекомендуем этому пользователю Бэтмена, а так же комикс от Image Comics.
+
+В итоге, в 3-ех проверках мы нашли, что в 1 случае рекомендации сработали плохо, в остальных 2ух. - приемлемо или хорошо. Одной из причин, помимо обычной ошибки/недочета, может быть то, что мы мало знаем о самом пользователе. Например, если он оценил пару комиксов, то будет очень сложно попасть "в точку". 
+
+
+Все рекомендательные системы построены, проверены и оценены. **Теперь можем перейти к рассмотрению вопросов и ситуаций, предложенных другими студенами майнора**. 
+
+**Примечание:** в силу характера вопросов и ситуаций мы смогли ответить на все из них с помощью одной функции, так как спрашивалось в основном про комиксы(а не пользователей). Однако примеры на обе системы и другие функции Вы можете найти выше после раздела с кодом функции - там есть демонстрация каждого сценария(про нового пользователя, старого итд).
+
+
+##### Примеры collaborative filtering - 2 примера(для нового и старого пользователя) были рассмотрены выше в проекте - см. раздел с функциями
+
+##### Примеры content-based -  некоторые вопросы объединены в одну секцию из-за схожего ответа.
+
+**Указанный пример:** Мне интересно, получится ли у меня вытащить комиксы DC через введение Marvel-комиксов как моих любимых. Они ведь довольно схожи по всем характеристикам кроме непосредственно издательства.
+
+**Ответ:** теоретически - да, получится, однако почти всегда при вводе комикса Марвел  список будет состоять именно из этой вселенной. Например:
+
+```{r}
+comics_function("Indestructible Hulk, Volume 1: Agent of S.H.I.E.L.D.", 5)
+```
+
+Или:
+
+```{r}
+comics_function("Wolverine: Origins, Volume 1: Born in Blood", 5)
+```
+
+Как видно из примеров выше - зачастую комиксам Марвел соответствуют другие комиксы Марвел.
+
+**Указанный пример:** Предположим, я положительно оценил комиксы с Людьми Икс и Черной Пантерой. Отрицательно (т.е. менее 4) я ничего не оценивал. В результате, я бы ожидал от системы, что она мне порекомендует Человека Паука, Фантастическую Четверку или что-нибудь ещё от вселенной Marvel.
+
+**Ответ:** в случае случайного комикса про Людей Х:
+
+```{r}
+comics_function("X-Men Legacy, Volume 3: Revenants", 5)
+```
+
+Все комиксы из Марвел, есть указанный в примере комикс конкретно про человека-паука.
+
+Для Черной Пантеры:
+
+```{r}
+comics_function("Black Panther: World of Wakanda", 5)
+```
+
+Здесь так же есть комиксы от Марвел, но не все. Возможно, это связано с тем, что комиксов(и информации о них) про Пантеру в системе немного, их всего 5. В любом случае, система все равно рекомендует Марвел в том числе.
+
+**Указанные примеры:** Какую рекомендацию получит пользователь, если в качестве любимого комикса введет "Avatar: The Last Airbender: The Search, Part 1 (The Search, #1)"?
+Самой первой скорее всего будет вторая часть этого комикса, но какими будут остальные рекомендации?
+
+если в функцию на вход дать какой-либо комикс avatar то какие комиксы порекомендует система? больше мангу или какие нибудь западные fantasy комиксы?
+
+**Ответ:** давайте посмотрим, что вернет функция с таким комиксом в качестве инпута:
+
+```{r}
+comics_function("Avatar: The Last Airbender: The Search, Part 1 (The Search, #1)", 5)
+```
+
+Так как наши датасеты немного различаются между группами, указанного студентом комикса у нас нет, но есть похожие по названию, используем их(к слову, выше получилась демонстрация сценария, когда введенного комикса нет в системе). Возьмем комикс 	Avatar: The Last Airbender: The Search, Part 3 (The Search, #3):
+
+```{r}
+comics_function("Avatar: The Last Airbender: The Rift, Part 1 (The Rift, #1)", 7)
+```
+
+Здесь система выдала много разных комиксов из разных вселенных(но 3/5 комиксов - манга), но в том числе на 4 месте можно увидеть другой комикс про Аватара.
+
+Ответ на второй вопрос: больше рекомендует комиксы Манга.
+
+**Указанные  примеры:** Любимый комиксы пользователя: "Наруто" и "Моя геройская академия". Будет ли ему порекомендован комикс "Магическая битва"?
+Результат: да, будет порекомендован (при наличии в датасете)
+
+Если пользователю нравится манга "Наруто", ему возможно понравилась бы манга "Блич"
+
+**Ответ:** к сожалению, комиксов про Наруто в нашем датасете обнаружено не было.
+
+**Указанный  пример:** Какую рекомендацию получит пользователь, который в первые использует данную платформу? Я ожидаю, что они доработают свой проект с учетом вновь прибывших пользователей и сделают функцию для таких случаев.
+
+**Ответ:** ничего дорабатывать не нужно, в видео было сказано, что все функции(где вводится id) так или иначе приспособлены к новым пользователям. Пример: новый пользователь просто вводит количество желаемых рекомендаций.
+
+```{r}
+user_function(2)
+```
+
+Или для системы коллаборативной фильтрации:
+
+```{r}
+comics_function_CF("новый пользователь", 1)
+```
+
+То есть новый пользователь, о котором наша система ничего не знает, получит список из N комиксов с наибольшей средней оценкой.
+
+**Указанный  пример:** По той причине, что у ребят есть такая функция, то я хотел бы проверить content-based систему. Давайте предположим, что мне нравится "Kamisama Kiss Vol.5" и я хочу 3 рекосендации. Исходя из анализа своей функции, я выделил несколько предположений о том, что я ожидаю на выходе:
+- Kamisama Kiss Vol.N, где N!=5
+- Noragami: Stray God #M
+- Fruits Basket Vol.K где N,M,K - натуральные числа
+Все эти книги - манга, и было бы странно получить что-то из разряда "Marvel" или "DC"
+
+**Ответ:** попробуем ввести указанный комикс
+
+```{r}
+comics_function("Kamisama Kiss Vol.5", 1)
+```
+
+Оказалось, что в системе такого комикса нет. Но у нас есть один комикс про Kamisama Kiss, введем его.
+
+
+```{r}
+comics_function("Kamisama Kiss, Vol. 9", 3)
+```
+
+Во-первых, из указанных 3-трех комиксов, которых студент ожидал в качестве рекомендации, у нас в системе есть только 2(один из них используется в самой функции, так что технически 1), во-вторых, нет, комиксов Марвел и DC получено не было, в-третьих, первый комикс в списке рекомендаций - комикс манга, что и ожидалось получить.
+
+**Указанный  пример:** Что будет, если я захочу получить 3 рекомендации и укажу, что мой любимый комикс "Ходячие Мертвецы"?
+
+**Ответ:** по случайному совпадению, этот пример был рассмотрен нами в секции оценивания, но все же:
+
+```{r}
+comics_function("The Walking Dead, Issue #15", 3)
+```
+
+Конкретно к 15-ому комиксу WD система рекомендует в первую очередь комиксы про все тех же Ходячих.
+
+
+**Указанный  пример от преподавателей:** Что будет порекомендовано пользователю, который написал отзыв с самой высокой оценкой сентимента?
+
+Сначала нам нужно найти пользователя, который написал этот отзыв. Однако для этого нужно заново сделать сентимент анализ, так как здесь мы группируем не по id книги, а по id пользователя, так как нам нужен именно пользователь, а не комикс
+
+```{r}
+reviews_add <- goodread_reviews %>% right_join(goodread_comics) %>% select(user_id, book_id, review_text, rating) 
+reviews_tidy_add <- reviews %>% unnest_tokens(words, review_text, token = "words")
+```
+
+```{r}
+stop_words = data.frame(words=stopwords("en"), stringsAsFactors=FALSE)
+reviews_tidy_1_add <- reviews_tidy_add %>% anti_join(stop_words)
+reviews_tidy_1_add$words <- lemmatize_words(reviews_tidy_1_add$words)
+```
+
+```{r}
+# используем словарь afinn
+sentdict = get_sentiments("afinn") 
+```
+
+```{r}
+new_tidy_add = reviews_tidy_1_add %>% inner_join(sentdict, by = c("words"="word"))
+new_review_sent_add = new_tidy_add %>% 
+  group_by(user_id) %>% 
+  summarize(sent = mean(value))
+```
+
+```{r}
+#наконец, нужный пользователь
+new_review_sent_add %>% arrange(-sent) %>% head(1)
+```
+
+Вопрос был связан с тем, что ему порекомендуется. Возьмем для этого функцию к content-based системе:
+
+
+```{r}
+user_function(2, "6009ef5729d427d9a0ad668d07ef1235")
+```
+
+**Ответ: **ему рекомендуется комиксы про Вендетту.
+
+
+### Выводы
+
+Проект завершен, поэтому можно сделать следующие выводы: хорошо проанализировав данный датасет про комиксы, можно создать рекомендательные системы разных видов. При использовании подхода content-based мы рассматривали схожесть комиксов между собой по разным признакам(всленные, названия итд). Что же касается второго метода, коллаборативной фильтрации, то в ней мы рассматривали пользователей и оценки, которые они дали прочитанным комиксам. Первая система рекомендует очень хорошо - при вводе данных зачастую получаем ожидаемый результат. Вторая система местами работает чуть хуже, однако все равно рекомендации актуальны. Более того, возможно, что рекомендации, которые мы оценили как неудачные на первый взгляд, в действительности окажутся актуальными для прльзователя. 
+
+Суммируя все вышесказанное, построенными рекомендательными системами можно смело пользоваться, если захотим найти комикс, похожий на те, что нам понравились.
+
+### Ответы на вопросы peer review - некоторые вопросы объединены в одну секцию из-за схожего ответа.
+
+**Вопросы:** 1) Непонятно как проводилась проверка на адекватность для коллаборативной фильтрации - говорилось, что сравниваются рекомендации пользователя и истинные предпочтения. По каким критериям сравнивались? По жанрам, по издателям? 2. Что использовали для коллаборативной фильтрации - IBCF или UBCF? Почему именно этот способ?
+
+2) У меня возник вопрос относительно того, какой метод коллаборативной фильтрации был использован: UBCF или IBCF?
+
+3) IBCF или UBCF? кажется не было указано;
+4) что делать новому юзеру в collaborative filtering?
+
+5) Какой метод был использован в коллаборативной фильтрации? Какие дал рекомендации?
+
+*Ответ:* 1) Сравнивались визуально по схожести по вселенным и конкретным комиксам(например, если пользователь любит комикс про Людей Икс, а мы рекомендуем тех же Людей Х, только другую часть, то рекомендация работает хорошо). 2) IBCF, так как дал меньшую ошибку RMSE и MAE. 3) новый юзер получит список из топ комиксов(с наивысшим средним баллом).
+
+**Вопрос:** Мне непонятно, как id автора (в content-based) помогает искать похожие комиксы, ведь id - это просто набор цифр, который не несет никакой информации о самом авторе. Было бы интересно поподробнее узнать, как на рекомендацию влияет принадлежность комикса к крупным вселенным (Marvel, DC, Image Comics), ведь издательство также есть в числе используемых характеристик. В выводах к коллаборативной фильтрации упоминается, что большинство пользователей оценило 1-2 комикса, значит ли это, что эти пользователи учитывались при построении рекомендательной системы или же порог по количеству оставленных отзывов выше?
+
+*Ответ:* Никак не помогает, этот момент был исправлен. Принадлежность к крупным вселенным - просто еще одна попытка как-то улучшить content-based систему. Чтобы определить, как именно влияет, нужно строить 2 системы - с этим показателем и без, смотреть на рекомендации, но вряд ли будут ярко выраженные различия в результатах. Насчет порога - мы столкнулись с проблемой, о которой упомянулось в работе: по требованиям в слэке было написано, что должно оставаться более 30% данных, но в нашем случае при пороге больше 1 - такой процент не сохранялся.
+
+
+**Вопросы:**  1) Честно говоря, в презентации не очень много кода и представления возможностей построенных систем. Было бы здорово взглянуть на них в лайв режиме.
+
+2) Хотелось бы, чтобы команда подробнее рассказала об оценке качества рекомендательных систем, чтобы в презентации было продемонстрировано больше кода, освещено больше технических моментов.
+
+3) Они упомянули сетевой и текстовый анализы, но не показали пример работы или еще что-то, но претензий у меня нет, так как работа выполнена очень качественно и было временное ограничение.
+
+4) Иногда (в основном в начале презентации) было сложно воспринимать информацию, не отображенную на слайдах, на слух. Так же в части про оценку системы не понятно, что значит "система рекомендует относительно неплохо" и "рекомендации удачны". Не было информации как были получены эти выводы
+
+*Ответ:* это не вопросы, а рекомендации/поправки/уточнения, тем не менее:
+
+1) Наилучшее представление о возможности систем - их функционал, презентуемый через функции. Они демонстрируются в видео.
+
+2) Довольно трудно объяснять каждый шаг не только теоретически, но и практически за 5 минут, не прибегая к ускорению речи(что делает просмотр труднее)
+
+
+
+
+
+
+
+
+
